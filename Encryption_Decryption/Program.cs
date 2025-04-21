@@ -1,4 +1,5 @@
 ﻿using Microsoft.Data.SqlClient;
+using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -165,25 +166,60 @@ public class Program
     {
         foreach (var tableName in tableNames)
         {
-            using var columnCommand = new SqlCommand("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName", conn);
+            var columns = new List<(string ColumnName, string FullType)>();
+
+            using var columnCommand = new SqlCommand(@"
+            SELECT 
+                COLUMN_NAME, 
+                DATA_TYPE, 
+                CHARACTER_MAXIMUM_LENGTH, 
+                NUMERIC_PRECISION, 
+                NUMERIC_SCALE, 
+                DATETIME_PRECISION
+            FROM INFORMATION_SCHEMA.COLUMNS 
+            WHERE TABLE_NAME = @TableName", conn);
+
             columnCommand.Parameters.AddWithValue("@TableName", tableName);
-            using var reader = columnCommand.ExecuteReader();
-            var columnData = new List<(string Column, string Type)>();
-            while (reader.Read())
-                columnData.Add((reader.GetString(0), reader.GetString(1).ToUpper()));
 
-            reader.Close(); // Close before next command
-
-            foreach (var (column, type) in columnData)
+            using (var reader = columnCommand.ExecuteReader())
             {
-                using var insertCommand = new SqlCommand("INSERT INTO TableSchemaInfo (TableName, ColumnName, FullType) VALUES (@TableName, @ColumnName, @FullType)", conn);
+                while (reader.Read())
+                {
+                    string column = reader.GetString(0);
+                    string dataType = reader.GetString(1);
+                    object charLen = reader["CHARACTER_MAXIMUM_LENGTH"];
+                    object numPrecision = reader["NUMERIC_PRECISION"];
+                    object numScale = reader["NUMERIC_SCALE"];
+                    object datetimePrecision = reader["DATETIME_PRECISION"];
+
+                    string fullType = dataType.ToUpper() switch
+                    {
+                        "NVARCHAR" or "VARCHAR" or "CHAR" or "NCHAR" =>
+                            $"{dataType}({(Convert.ToInt32(charLen) == -1 ? "MAX" : charLen)})",
+                        "DECIMAL" or "NUMERIC" =>
+                            $"{dataType}({numPrecision},{numScale})",
+                        "DATETIME2" =>
+                            $"{dataType}({datetimePrecision})",
+                        _ => dataType
+                    };
+
+                    columns.Add((column, fullType));
+                }
+            } 
+
+            // 再來用 INSERT
+            foreach (var (col, fullType) in columns)
+            {
+                using var insertCommand = new SqlCommand(
+                    "INSERT INTO TableSchemaInfo (TableName, ColumnName, FullType) VALUES (@TableName, @ColumnName, @FullType)", conn);
                 insertCommand.Parameters.AddWithValue("@TableName", tableName);
-                insertCommand.Parameters.AddWithValue("@ColumnName", column);
-                insertCommand.Parameters.AddWithValue("@FullType", type);
+                insertCommand.Parameters.AddWithValue("@ColumnName", col);
+                insertCommand.Parameters.AddWithValue("@FullType", fullType);
                 insertCommand.ExecuteNonQuery();
             }
         }
     }
+
 
     private static string Encode(string value) => Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
     private static string Decode(string value) => Encoding.UTF8.GetString(Convert.FromBase64String(value));
