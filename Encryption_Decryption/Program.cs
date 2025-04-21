@@ -5,51 +5,39 @@ using System.Text.RegularExpressions;
 public class Program
 {
     private static readonly string connectionString =
-       "連線字串";
-    private static readonly List<string> ConfidentialEntries = new() { "隱碼欄位名稱(不分大小寫)", "隱碼欄位名稱(不分大小寫)" };
+      "Server=(localdb)\\MSSQLLocalDB;Database=CDP;Trusted_Connection=True";
+    private static readonly List<string> ConfidentialEntries = new() { "ActivityName" };
 
-    public static void Main()
-    {
-        MainProgram();
-    }
+    public static void Main() => MainProgram();
 
     private static void MainProgram()
     {
-        Console.WriteLine($"請輸入功能資料庫名稱：");
+        Console.WriteLine("請輸入功能資料庫名稱：");
         var dbName = Console.ReadLine()?.Trim() ?? "";
-        var tableNames = GetTableNames(connectionString, dbName);
+        var tableNames = GetTableNames(dbName);
 
         while (true)
         {
-            Console.WriteLine($"1.存取資料庫原有設計");
-            Console.WriteLine($"2.資料庫隱碼");
-            Console.WriteLine($"3.資料庫解碼");
-            Console.WriteLine($"請輸入功能(數字) ：");
+            Console.WriteLine("1.存取資料庫原有設計");
+            Console.WriteLine("2.資料庫隱碼");
+            Console.WriteLine("3.資料庫解碼");
+            Console.WriteLine("請輸入功能(數字) ：");
 
             var selectVal = Console.ReadLine()?.Trim();
+
+            using var conn = new SqlConnection(connectionString);
+            conn.Open();
 
             switch (selectVal)
             {
                 case "1":
-                    using (var conn = new SqlConnection(connectionString))
-                    {
-                        conn.Open();
-                        ScanTableSchema(conn, tableNames);
-                    }
+                    ScanTableSchema(conn, tableNames);
                     return;
                 case "2":
-                    using (var conn = new SqlConnection(connectionString))
-                    {
-                        conn.Open();
-                        ProcessConfidentialData(conn, dbName, tableNames, encode: true);
-                    }
+                    ProcessConfidentialData(conn, dbName, tableNames, encode: true);
                     return;
                 case "3":
-                    using (var conn = new SqlConnection(connectionString))
-                    {
-                        conn.Open();
-                        ProcessConfidentialData(conn, dbName, tableNames, encode: false);
-                    }
+                    ProcessConfidentialData(conn, dbName, tableNames, encode: false);
                     return;
                 default:
                     Console.WriteLine("請輸入正確選項（1~3）");
@@ -80,15 +68,8 @@ public class Program
 
                 Console.WriteLine($"{tableName}.{column} => ******");
 
-                if (encode)
-                {
-                    UpdateColumnType(conn, tableName, column, "NVARCHAR(MAX)");
-                }
-                else
-                {
-                    var fullType = GetFullType(conn, tableName, column) ?? "NVARCHAR(MAX)";
-                    UpdateColumnType(conn, tableName, column, fullType);
-                }
+                var originalType = encode ? "NVARCHAR(MAX)" : GetFullType(conn, tableName, column) ?? "NVARCHAR(MAX)";
+                UpdateColumnType(conn, tableName, column, originalType);
 
                 var columnValues = GetColumnValues(conn, tableName, column);
 
@@ -96,59 +77,47 @@ public class Program
                 {
                     Console.WriteLine($"{tableName}.{column}.{value} => ******");
 
-                    if (encode)
+                    if (encode && !IsBase64String(value))
                     {
-                        if (IsBase64String(value))
-                        {
-                            Console.WriteLine("已是Base64 => 跳過");
-                            continue;
-                        }
-                        string encoded = Encode(value);
-                        InsertColumnData(conn, tableName, column, encoded);
+                        var encoded = Encode(value);
+                        InsertColumnData(conn, tableName, column, encoded, value);
                         Console.WriteLine($"{tableName}.{column} => {encoded}");
+                    }
+                    else if (!encode && IsBase64String(value))
+                    {
+                        var decoded = Decode(value);
+                        InsertColumnData(conn, tableName, column, decoded, value);
+                        Console.WriteLine($"{tableName}.{column} => {decoded}");
                     }
                     else
                     {
-                        if (!IsBase64String(value))
-                        {
-                            Console.WriteLine("不是Base64 => 跳過");
-                            continue;
-                        }
-                        string decoded = Decode(value);
-                        InsertColumnData(conn, tableName, column, decoded);
-                        Console.WriteLine($"{tableName}.{column} => {decoded}");
+                        Console.WriteLine("符合條件 => 跳過");
                     }
                 }
             }
         }
     }
 
-    // --- Helper Methods ---
-
-    private static List<string> GetTableNames(string connectionString, string dbName)
+    private static List<string> GetTableNames(string dbName)
     {
+        var tableNames = new List<string>();
         using var conn = new SqlConnection(connectionString);
         conn.Open();
-        var tableNames = new List<string>();
-
-        using var command = new SqlCommand($"USE {dbName}; SELECT name FROM sys.tables", conn);
+        using var command = new SqlCommand($"USE [{dbName}]; SELECT name FROM sys.tables", conn);
         using var reader = command.ExecuteReader();
         while (reader.Read())
             tableNames.Add(reader.GetString(0));
-
         return tableNames;
     }
 
     private static List<string> GetTableColumns(SqlConnection conn, string dbName, string tableName)
     {
         var columns = new List<string>();
-        using var command = new SqlCommand($"USE {dbName}; SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName", conn);
+        using var command = new SqlCommand($"USE [{dbName}]; SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName", conn);
         command.Parameters.AddWithValue("@TableName", tableName);
-
         using var reader = command.ExecuteReader();
         while (reader.Read())
             columns.Add(reader.GetString(0));
-
         return columns;
     }
 
@@ -158,10 +127,7 @@ public class Program
         using var command = new SqlCommand($"SELECT DISTINCT [{column}] FROM [{tableName}] WHERE [{column}] IS NOT NULL", conn);
         using var reader = command.ExecuteReader();
         while (reader.Read())
-        {
-            if (!reader.IsDBNull(0))
-                values.Add(reader.GetString(0));
-        }
+            values.Add(reader.GetString(0));
         return values;
     }
 
@@ -182,18 +148,16 @@ public class Program
 
     private static void UpdateColumnType(SqlConnection conn, string tableName, string columnName, string newType)
     {
-        if (!IsValidSqlIdentifier(tableName) || !IsValidSqlIdentifier(columnName))
-            return;
-
+        if (!IsValidSqlIdentifier(tableName) || !IsValidSqlIdentifier(columnName)) return;
         using var command = new SqlCommand($"ALTER TABLE [{tableName}] ALTER COLUMN [{columnName}] {newType}", conn);
         command.ExecuteNonQuery();
     }
 
-    private static void InsertColumnData(SqlConnection conn, string tableName, string columnName, string value)
+    private static void InsertColumnData(SqlConnection conn, string tableName, string columnName, string newValue, string oldValue)
     {
-        using var command = new SqlCommand($"UPDATE [{tableName}] SET [{columnName}] = @Value WHERE [{columnName}] = @OldValue", conn);
-        command.Parameters.AddWithValue("@Value", value);
-        command.Parameters.AddWithValue("@OldValue", !IsBase64String(value) ? Encode(value) : Decode(value));
+        using var command = new SqlCommand($"UPDATE [{tableName}] SET [{columnName}] = @NewValue WHERE [{columnName}] = @OldValue", conn);
+        command.Parameters.AddWithValue("@NewValue", newValue);
+        command.Parameters.AddWithValue("@OldValue", oldValue);
         command.ExecuteNonQuery();
     }
 
@@ -204,16 +168,18 @@ public class Program
             using var columnCommand = new SqlCommand("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName", conn);
             columnCommand.Parameters.AddWithValue("@TableName", tableName);
             using var reader = columnCommand.ExecuteReader();
+            var columnData = new List<(string Column, string Type)>();
             while (reader.Read())
-            {
-                string column = reader.GetString(0);
-                string dataType = reader.GetString(1);
-                string fullType = dataType.ToUpper();
+                columnData.Add((reader.GetString(0), reader.GetString(1).ToUpper()));
 
+            reader.Close(); // Close before next command
+
+            foreach (var (column, type) in columnData)
+            {
                 using var insertCommand = new SqlCommand("INSERT INTO TableSchemaInfo (TableName, ColumnName, FullType) VALUES (@TableName, @ColumnName, @FullType)", conn);
                 insertCommand.Parameters.AddWithValue("@TableName", tableName);
                 insertCommand.Parameters.AddWithValue("@ColumnName", column);
-                insertCommand.Parameters.AddWithValue("@FullType", fullType);
+                insertCommand.Parameters.AddWithValue("@FullType", type);
                 insertCommand.ExecuteNonQuery();
             }
         }
