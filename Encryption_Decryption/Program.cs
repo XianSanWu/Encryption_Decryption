@@ -70,7 +70,12 @@ public class Program
                 Console.WriteLine($"{tableName}.{column} => ******");
 
                 var originalType = encode ? "NVARCHAR(MAX)" : GetFullType(conn, tableName, column) ?? "NVARCHAR(MAX)";
-                UpdateColumnType(conn, tableName, column, originalType);
+                var updateColumnType =  UpdateColumnType(conn, tableName, column, originalType);
+                if (!updateColumnType)
+                {
+                    Console.WriteLine($"無法更新欄位類型：{tableName}.{column} => 跳過");
+                    continue;
+                }
 
                 var columnValues = GetColumnValues(conn, tableName, column);
 
@@ -147,11 +152,22 @@ public class Program
         return command.ExecuteScalar() as string;
     }
 
-    private static void UpdateColumnType(SqlConnection conn, string tableName, string columnName, string newType)
+    private static bool UpdateColumnType(SqlConnection conn, string tableName, string columnName, string newType)
     {
-        if (!IsValidSqlIdentifier(tableName) || !IsValidSqlIdentifier(columnName)) return;
-        using var command = new SqlCommand($"ALTER TABLE [{tableName}] ALTER COLUMN [{columnName}] {newType}", conn);
-        command.ExecuteNonQuery();
+        try
+        {
+            if (!IsValidSqlIdentifier(tableName) || !IsValidSqlIdentifier(columnName)) return false;
+            using var command = new SqlCommand($"ALTER TABLE [{tableName}] ALTER COLUMN [{columnName}] {newType}", conn);
+            command.ExecuteNonQuery();
+        }
+        catch (Exception)
+        {
+            Console.WriteLine("無法更新此欄位 => 跳過");
+            return false;
+        }
+
+        return true;
+
     }
 
     private static void InsertColumnData(SqlConnection conn, string tableName, string columnName, string newValue, string oldValue)
@@ -166,55 +182,67 @@ public class Program
     {
         foreach (var tableName in tableNames)
         {
-            var columns = new List<(string ColumnName, string FullType)>();
+            var columns = new List<(string ColumnName, string dataType, string FullType, string? DefaultValue, bool IsNullable)>();
 
             using var columnCommand = new SqlCommand(@"
             SELECT 
-                COLUMN_NAME, 
-                DATA_TYPE, 
-                CHARACTER_MAXIMUM_LENGTH, 
-                NUMERIC_PRECISION, 
-                NUMERIC_SCALE, 
-                DATETIME_PRECISION
-            FROM INFORMATION_SCHEMA.COLUMNS 
-            WHERE TABLE_NAME = @TableName", conn);
+                col.COLUMN_NAME, 
+                col.DATA_TYPE, 
+                col.CHARACTER_MAXIMUM_LENGTH, 
+                col.NUMERIC_PRECISION, 
+                col.NUMERIC_SCALE, 
+                col.DATETIME_PRECISION,
+                col.IS_NULLABLE,
+                dc.definition AS DefaultValue
+            FROM INFORMATION_SCHEMA.COLUMNS col
+            LEFT JOIN sys.columns sc ON sc.name = col.COLUMN_NAME
+            LEFT JOIN sys.tables st ON st.name = col.TABLE_NAME AND st.object_id = sc.object_id
+            LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = st.object_id AND dc.parent_column_id = sc.column_id
+            WHERE col.TABLE_NAME = @TableName", conn);
 
             columnCommand.Parameters.AddWithValue("@TableName", tableName);
 
-            using (var reader = columnCommand.ExecuteReader())
+            using var reader = columnCommand.ExecuteReader();
+            while (reader.Read())
             {
-                while (reader.Read())
+                string column = reader.GetString(0);
+                string dataType = reader.GetString(1);
+                object charLen = reader["CHARACTER_MAXIMUM_LENGTH"];
+                object numPrecision = reader["NUMERIC_PRECISION"];
+                object numScale = reader["NUMERIC_SCALE"];
+                object datetimePrecision = reader["DATETIME_PRECISION"];
+                string isNullableStr = reader["IS_NULLABLE"].ToString()!;
+                bool isNullable = isNullableStr.Equals("YES", StringComparison.OrdinalIgnoreCase);
+                string? defaultValue = reader["DefaultValue"] as string;
+
+                string fullType = dataType.ToUpper() switch
                 {
-                    string column = reader.GetString(0);
-                    string dataType = reader.GetString(1);
-                    object charLen = reader["CHARACTER_MAXIMUM_LENGTH"];
-                    object numPrecision = reader["NUMERIC_PRECISION"];
-                    object numScale = reader["NUMERIC_SCALE"];
-                    object datetimePrecision = reader["DATETIME_PRECISION"];
+                    "NVARCHAR" or "VARCHAR" or "CHAR" or "NCHAR" =>
+                        $"{dataType}({(Convert.ToInt32(charLen) == -1 ? "MAX" : charLen)})",
+                    "DECIMAL" or "NUMERIC" =>
+                        $"{dataType}({numPrecision},{numScale})",
+                    "DATETIME2" =>
+                        $"{dataType}({datetimePrecision})",
+                    _ => dataType
+                };
 
-                    string fullType = dataType.ToUpper() switch
-                    {
-                        "NVARCHAR" or "VARCHAR" or "CHAR" or "NCHAR" =>
-                            $"{dataType}({(Convert.ToInt32(charLen) == -1 ? "MAX" : charLen)})",
-                        "DECIMAL" or "NUMERIC" =>
-                            $"{dataType}({numPrecision},{numScale})",
-                        "DATETIME2" =>
-                            $"{dataType}({datetimePrecision})",
-                        _ => dataType
-                    };
+                columns.Add((column, dataType, fullType, defaultValue, isNullable));
+            }
 
-                    columns.Add((column, fullType));
-                }
-            } 
+            reader.Close();
 
-            // 再來用 INSERT
-            foreach (var (col, fullType) in columns)
+            foreach (var (col, dataType, fullType, defaultValue, isNullable) in columns)
             {
-                using var insertCommand = new SqlCommand(
-                    "INSERT INTO TableSchemaInfo (TableName, ColumnName, FullType) VALUES (@TableName, @ColumnName, @FullType)", conn);
+                using var insertCommand = new SqlCommand(@"
+                INSERT INTO TableSchemaInfo (TableName, ColumnName, DataType, FullType, DefaultValue, IsNullable) 
+                VALUES (@TableName, @ColumnName, @DataType, @FullType, @DefaultValue, @IsNullable)", conn);
+
                 insertCommand.Parameters.AddWithValue("@TableName", tableName);
                 insertCommand.Parameters.AddWithValue("@ColumnName", col);
+                insertCommand.Parameters.AddWithValue("@DataType", dataType);
                 insertCommand.Parameters.AddWithValue("@FullType", fullType);
+                insertCommand.Parameters.AddWithValue("@DefaultValue", (object?)defaultValue ?? DBNull.Value);
+                insertCommand.Parameters.AddWithValue("@IsNullable", isNullable);
                 insertCommand.ExecuteNonQuery();
             }
         }
