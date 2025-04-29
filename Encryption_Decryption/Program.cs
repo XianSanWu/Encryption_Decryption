@@ -70,7 +70,7 @@ public class Program
                 Console.WriteLine($"{tableName}.{column} => ******");
 
                 var originalType = encode ? "NVARCHAR(MAX)" : GetFullType(conn, tableName, column) ?? "NVARCHAR(MAX)";
-                var updateColumnType =  UpdateColumnType(conn, tableName, column, originalType);
+                var updateColumnType = UpdateColumnType(conn, tableName, column, originalType);
                 if (!updateColumnType)
                 {
                     Console.WriteLine($"無法更新欄位類型：{tableName}.{column} => 跳過");
@@ -182,23 +182,30 @@ public class Program
     {
         foreach (var tableName in tableNames)
         {
+            if (IsTableAlreadyScanned(conn, tableName))
+            {
+                Console.WriteLine($"已存在於 TableSchemaInfo：{tableName} => 跳過");
+                continue;
+            }
+
             var columns = new List<(string ColumnName, string dataType, string FullType, string? DefaultValue, bool IsNullable)>();
 
             using var columnCommand = new SqlCommand(@"
-            SELECT 
-                col.COLUMN_NAME, 
-                col.DATA_TYPE, 
-                col.CHARACTER_MAXIMUM_LENGTH, 
-                col.NUMERIC_PRECISION, 
-                col.NUMERIC_SCALE, 
-                col.DATETIME_PRECISION,
-                col.IS_NULLABLE,
-                dc.definition AS DefaultValue
-            FROM INFORMATION_SCHEMA.COLUMNS col
-            LEFT JOIN sys.columns sc ON sc.name = col.COLUMN_NAME
-            LEFT JOIN sys.tables st ON st.name = col.TABLE_NAME AND st.object_id = sc.object_id
-            LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = st.object_id AND dc.parent_column_id = sc.column_id
-            WHERE col.TABLE_NAME = @TableName", conn);
+SELECT 
+    col.COLUMN_NAME, 
+    col.DATA_TYPE, 
+    col.CHARACTER_MAXIMUM_LENGTH, 
+    col.NUMERIC_PRECISION, 
+    col.NUMERIC_SCALE, 
+    col.DATETIME_PRECISION,
+    col.IS_NULLABLE,
+    dc.definition AS DefaultValue
+FROM INFORMATION_SCHEMA.COLUMNS col
+INNER JOIN sys.tables st ON st.name = col.TABLE_NAME AND st.schema_id = SCHEMA_ID(col.TABLE_SCHEMA)
+INNER JOIN sys.columns sc ON sc.name = col.COLUMN_NAME AND sc.object_id = st.object_id
+LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = st.object_id AND dc.parent_column_id = sc.column_id
+WHERE col.TABLE_NAME = @TableName AND col.TABLE_SCHEMA = 'dbo'", conn);
+
 
             columnCommand.Parameters.AddWithValue("@TableName", tableName);
 
